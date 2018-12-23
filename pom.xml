@@ -32,7 +32,7 @@
         <relativePath />
     </parent>
     <artifactId>pipeline-maven-parent</artifactId>
-    <version>3.6.5</version>
+    <version>3.6.5-p-SNAPSHOT</version>
     <packaging>pom</packaging>
 
     <name>Pipeline Maven Integration Plugin Parent</name>

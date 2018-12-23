@@ -14,11 +14,16 @@ import org.jenkinsci.plugins.pipeline.maven.GlobalPipelineMavenConfig;
 import org.jenkinsci.plugins.pipeline.maven.MavenArtifact;
 import org.jenkinsci.plugins.pipeline.maven.cause.MavenDependencyCauseHelper;
 import org.jenkinsci.plugins.pipeline.maven.cause.MavenDependencyUpstreamCause;
+import org.jenkinsci.plugins.pipeline.maven.publishers.PipelineGraphPublisher;
+import org.jenkinsci.plugins.pipeline.maven.publishers.PipelineGraphPublisher.PipelineGraphPublisherAction;
 import org.jenkinsci.plugins.pipeline.maven.trigger.WorkflowJobDependencyTrigger;
 import org.jenkinsci.plugins.workflow.job.WorkflowJob;
 import org.jenkinsci.plugins.workflow.job.WorkflowRun;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -46,6 +51,62 @@ public class DownstreamPipelineTriggerRunListener extends RunListener<WorkflowRu
 
     @Inject
     public GlobalPipelineMavenConfig globalPipelineMavenConfig;
+
+    //
+    // HACK: skip all transitive
+    //       i.e.: reducing downstream pipelines to iterate over
+    //       as usual this is not pretty, just works
+    //
+    private List<String> getDownstreamPipelines(WorkflowRun build) {
+        if (build == null) {
+            return Collections.EMPTY_LIST;
+        }
+        return
+            globalPipelineMavenConfig.getDao().listDownstreamJobs(build.getParent().getFullName(), build.getNumber());
+    }
+    private Set<String> reduceDownstreamTriggers(
+            WorkflowJob upstreamPipeline, String skipDownstreamTriggersPattern,
+            List<String> downstreamPipelines, Set<String> downTriggers, Set<String> downRemovedTriggers) {
+
+        for (String downstreamPipelineFullName : downstreamPipelines) {
+            if ((skipDownstreamTriggersPattern != null)
+                && downstreamPipelineFullName.matches(skipDownstreamTriggersPattern)) {
+                continue;
+            }
+
+            final WorkflowJob downstreamPipeline =
+                Jenkins.getInstance().getItemByFullName(downstreamPipelineFullName, WorkflowJob.class);
+
+            if (downstreamPipeline == null) {
+                continue;
+            }
+
+            WorkflowRun build = downstreamPipeline.getLastCompletedBuild();
+
+            if (build == null) {
+                continue;
+            }
+
+            List<String> transitives = getDownstreamPipelines(build);
+            if (transitives == null) {
+                continue;
+            }
+
+            transitives.remove(downstreamPipelineFullName);
+            transitives.removeAll(downRemovedTriggers);
+
+            for (String transitive : transitives) {
+                if (downTriggers.remove(transitive)) {
+                    downRemovedTriggers.add(transitive);
+                }
+            }
+
+            reduceDownstreamTriggers(
+                upstreamPipeline, skipDownstreamTriggersPattern, transitives, downTriggers, downRemovedTriggers);
+        }
+        return downTriggers;
+    }
+    //
 
     @Override
     public void onCompleted(WorkflowRun upstreamBuild, @Nonnull TaskListener listener) {
@@ -83,8 +144,35 @@ public class DownstreamPipelineTriggerRunListener extends RunListener<WorkflowRu
             MavenArtifact mavenArtifact = entry.getKey();
             SortedSet<String> downstreamPipelines = entry.getValue();
 
+            // HACK: p
+            Set<String> downTriggers = new HashSet<>(downstreamPipelines);
+            Set<String> downRemovedTriggers = new HashSet<>();
+            String skipDownstreamTriggersPattern = null;
+            PipelineGraphPublisherAction pipelineGraphPublisherAction =
+                    upstreamBuild.getAction(PipelineGraphPublisherAction.class);
+            if (pipelineGraphPublisherAction != null) {
+                PipelineGraphPublisher pipelineGraphPublisher = pipelineGraphPublisherAction.getPipelineGraphPublisher();
+                skipDownstreamTriggersPattern = pipelineGraphPublisher.getSkipDownstreamTriggersPattern();
+                reduceDownstreamTriggers(
+                        upstreamPipeline, skipDownstreamTriggersPattern,
+                        new ArrayList<>(downstreamPipelines), downTriggers, downRemovedTriggers);
+            }
+            // HACK: skip all transitive
+            for (String removed : downRemovedTriggers) {
+                if (LOGGER.isLoggable(Level.FINE)) {
+                    listener.getLogger()
+                        .println(
+                            "[withMaven] Skip triggering transitive downstream pipeline "
+                                + ModelHyperlinkNote.encodeTo(
+                                    Jenkins.getInstance().getItemByFullName(removed, WorkflowJob.class))
+                                + ".");
+                }
+                continue;
+            }
+            //
+
             downstreamPipelinesLoop:
-            for (String downstreamPipelineFullName : downstreamPipelines) {
+            for (String downstreamPipelineFullName : downTriggers) {
 
                 if (jobsToTrigger.containsKey(downstreamPipelineFullName)) {
                     // downstream pipeline has already been added to the list of pipelines to trigger,
@@ -118,7 +206,7 @@ public class DownstreamPipelineTriggerRunListener extends RunListener<WorkflowRu
                 List<MavenArtifact> downstreamPipelineGeneratedArtifacts = globalPipelineMavenConfig.getDao().getGeneratedArtifacts(downstreamPipelineFullName, downstreamBuildNumber);
                 if (LOGGER.isLoggable(Level.FINEST)) {
                     listener.getLogger().println("[withMaven] downstreamPipelineTriggerRunListener - Pipeline " + ModelHyperlinkNote.encodeTo(downstreamPipeline) + " evaluated for because it has a dependency on " + mavenArtifact + " generates " + downstreamPipelineGeneratedArtifacts);
-                } 
+                }
 
                 for (MavenArtifact downstreamPipelineGeneratedArtifact : downstreamPipelineGeneratedArtifacts) {
                     if (Objects.equals(mavenArtifact.getGroupId(), downstreamPipelineGeneratedArtifact.getGroupId()) &&
@@ -141,6 +229,18 @@ public class DownstreamPipelineTriggerRunListener extends RunListener<WorkflowRu
                         continue downstreamPipelinesLoop;
                     }
                 }
+
+                // HACK: add a way to exclude triggers by pattern
+                if ((skipDownstreamTriggersPattern != null)
+                        && downstreamPipelineFullName.matches(skipDownstreamTriggersPattern)) {
+                    listener.getLogger()
+                        .println(
+                            "[withMaven] Skip triggering of downstream pipeline "
+                                + ModelHyperlinkNote.encodeTo(downstreamPipeline)
+                                + " because of pattern matching.");
+                    continue;
+                }
+                //
 
                 // Avoid excessive triggering
                 // See #46313
